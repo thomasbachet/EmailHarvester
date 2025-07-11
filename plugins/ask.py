@@ -55,16 +55,29 @@ class AskSearch(object):
         try:
             urly = self.url.format(page=str(self.page), word=self.word)
             headers = {'User-Agent': self.userAgent}
+            # Security: Add timeouts and SSL verification
             if(self.proxy):
                 proxies = {self.proxy.scheme: "http://" + self.proxy.netloc}
-                r=requests.get(urly, headers=headers, proxies=proxies)
+                r = requests.get(urly, headers=headers, proxies=proxies, timeout=30, verify=True)
             else:
-                r=requests.get(urly, headers=headers)
+                r = requests.get(urly, headers=headers, timeout=30, verify=True)
                 
+        except requests.exceptions.Timeout:
+            print(red("[-] Request timeout for ASK search"))
+            return
+        except requests.exceptions.SSLError as e:
+            print(red(f"[-] SSL verification failed for ASK search: {e}"))
+            return
+        except requests.exceptions.RequestException as e:
+            print(red(f"[-] Request failed for ASK search: {e}"))
+            return
         except Exception as e:
-            print(e)
-            sys.exit(4)
+            print(red(f"[-] Unexpected error in ASK search: {e}"))
+            return
         
+        if r.encoding is None:
+            r.encoding = 'UTF-8'
+            
         self.results = r.content.decode(r.encoding)
         self.totalresults += self.results
     
@@ -82,7 +95,7 @@ class AskSearch(object):
     
     
 def search(domain, limit):
-    url = "http://www.ask.com/web?q=%40{word}&page={page}"
+    url = "https://www.ask.com/web?q=%40{word}&page={page}"
     search = AskSearch(url, domain, limit)
     search.process()
     return search.get_emails()

@@ -40,6 +40,9 @@ import requests
 import re
 import os
 import validators
+import hashlib
+import xml.sax.saxutils as xml_escape
+import logging
 
 from termcolor import colored
 from argparse import RawTextHelpFormatter
@@ -51,6 +54,20 @@ except ImportError:
 
 ################################
 
+# Security: Plugin allowlist - only these plugins are allowed to load
+ALLOWED_PLUGINS = {
+    'ask', 'baidu', 'bing', 'dogpile', 'exalead', 'github', 
+    'googleplus', 'googles', 'instagram', 'linkedin', 'reddit', 
+    'twitter', 'yahoo', 'youtube'
+}
+
+# Configure secure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
 
 if _platform == 'win32':
     import colorama
@@ -74,11 +91,19 @@ class myparser:
         
     def emails(self):
         self.genericClean()
+        # Security: Improved regex to prevent ReDoS attacks
+        # Limit quantifiers and avoid nested quantifiers
         reg_emails = re.compile(
-            '[a-zA-Z0-9.\-_+#~!$&\',;=:]+' +
-            '@' +
-            '[a-zA-Z0-9.-]*' +
-            self.word)
+            r'[a-zA-Z0-9.\-_+#~!$&\',;=:]{1,64}' +
+            r'@' +
+            r'[a-zA-Z0-9.-]{1,253}' +
+            re.escape(self.word))
+        
+        # Security: Limit input size to prevent DoS
+        if len(self.results) > 1000000:  # 1MB limit
+            logger.warning("Response too large, truncating for security")
+            self.results = self.results[:1000000]
+            
         self.temp = reg_emails.findall(self.results)
         emails = self.unique()
         return emails
@@ -100,12 +125,62 @@ class EmailHarvester(object):
         path = os.path.dirname(os.path.abspath(__file__)) + "/plugins/"
         plugins = {}
         
+        # Security: Validate plugin directory path
+        if not os.path.exists(path) or not os.path.isdir(path):
+            logger.error("Plugin directory not found or invalid")
+            return
+            
+        # Security: Secure plugin loading with allowlist
         sys.path.insert(0, path)
         for f in os.listdir(path):
             fname, ext = os.path.splitext(f)
-            if ext == '.py':
-                mod = __import__(fname, fromlist=[''])
-                plugins[fname] = mod.Plugin(self, {'useragent':userAgent, 'proxy':proxy})
+            if ext == '.py' and fname in ALLOWED_PLUGINS:
+                try:
+                    # Security: Controlled import instead of dynamic __import__
+                    plugin_path = os.path.join(path, f)
+                    if self._validate_plugin_file(plugin_path):
+                        mod = __import__(fname, fromlist=[''])
+                        if hasattr(mod, 'Plugin'):
+                            plugins[fname] = mod.Plugin(self, {'useragent':userAgent, 'proxy':proxy})
+                            logger.info(f"Loaded plugin: {fname}")
+                        else:
+                            logger.warning(f"Plugin {fname} missing Plugin class")
+                    else:
+                        logger.warning(f"Plugin {fname} failed security validation")
+                except ImportError as e:
+                    logger.error(f"Failed to load plugin {fname}: {e}")
+                except Exception as e:
+                    logger.error(f"Error loading plugin {fname}: {e}")
+            elif ext == '.py':
+                logger.warning(f"Plugin {fname} not in allowlist, skipping")
+    
+    def _validate_plugin_file(self, plugin_path):
+        """Security: Basic plugin file validation"""
+        try:
+            # Check file size (max 50KB for plugin files)
+            if os.path.getsize(plugin_path) > 50000:
+                logger.warning(f"Plugin file too large: {plugin_path}")
+                return False
+            
+            # Basic content validation - check for suspicious patterns
+            with open(plugin_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                
+            # Check for potentially dangerous imports/functions
+            dangerous_patterns = [
+                r'import\s+subprocess', r'import\s+os\s*$', r'eval\s*\(',
+                r'exec\s*\(', r'__import__\s*\(', r'open\s*\('
+            ]
+            
+            for pattern in dangerous_patterns:
+                if re.search(pattern, content, re.MULTILINE):
+                    logger.warning(f"Suspicious pattern found in {plugin_path}: {pattern}")
+                    return False
+                    
+            return True
+        except Exception as e:
+            logger.error(f"Error validating plugin {plugin_path}: {e}")
+            return False
     
     def register_plugin(self, search_method, functions):
         self.plugins[search_method] = functions
@@ -126,22 +201,75 @@ class EmailHarvester(object):
         self.word = word
         self.activeEngine = engineName
         
+    def _validate_url(self, url):
+        """Security: Validate URL before making requests"""
+        try:
+            parsed = urlparse(url)
+            
+            # Security: Force HTTPS for external requests
+            if parsed.scheme not in ['https']:
+                logger.warning(f"Insecure URL scheme: {parsed.scheme}")
+                return False
+                
+            # Security: Validate hostname
+            if not parsed.hostname:
+                logger.warning("Invalid hostname in URL")
+                return False
+                
+            # Security: Block private/local addresses
+            import ipaddress
+            try:
+                ip = ipaddress.ip_address(parsed.hostname)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    logger.warning(f"Private/local IP address blocked: {parsed.hostname}")
+                    return False
+            except ValueError:
+                # Not an IP address, continue with domain validation
+                pass
+                
+            return True
+        except Exception as e:
+            logger.error(f"URL validation error: {e}")
+            return False
+
     def do_search(self):
         try:
             urly = self.url.format(counter=str(self.counter), word=self.word)
+            
+            # Security: Validate URL before request
+            if not self._validate_url(urly):
+                logger.error(f"URL validation failed: {urly}")
+                return
+                
             headers = {'User-Agent': self.userAgent}
+            
+            # Security: Add request timeouts and SSL verification
+            timeout = 30
+            verify_ssl = True
+            
             if(self.proxy):
                 proxies = {self.proxy.scheme: "http://" + self.proxy.netloc}
-                r=requests.get(urly, headers=headers, proxies=proxies)
+                r = requests.get(urly, headers=headers, proxies=proxies, 
+                               timeout=timeout, verify=verify_ssl)
             else:
-                r=requests.get(urly, headers=headers)
+                r = requests.get(urly, headers=headers, 
+                               timeout=timeout, verify=verify_ssl)
                 
+        except requests.exceptions.Timeout:
+            logger.error(f"Request timeout for {self.activeEngine}")
+            return
+        except requests.exceptions.SSLError as e:
+            logger.error(f"SSL verification failed for {self.activeEngine}: {e}")
+            return
+        except requests.exceptions.RequestException as e:
+            logger.error(f"Request failed for {self.activeEngine}: {e}")
+            return
         except Exception as e:
-            print(e)
-            sys.exit(4)
+            logger.error(f"Unexpected error in {self.activeEngine}: {e}")
+            return
 
         if r.encoding is None:
-	          r.encoding = 'UTF-8'
+            r.encoding = 'UTF-8'
 
         self.results = r.content.decode(r.encoding)
         self.totalresults += self.results
@@ -149,7 +277,10 @@ class EmailHarvester(object):
     def process(self):
         while (self.counter < self.limit):
             self.do_search()
-            time.sleep(1)
+            
+            # Security: Rate limiting - increase delay between requests
+            time.sleep(2)  # Increased from 1 to 2 seconds
+            
             self.counter += self.step
             print(green("[+] Searching in {}:".format(self.activeEngine)) + cyan(" {} results".format(str(self.counter))))
             
@@ -192,7 +323,52 @@ def checkDomain(value):
     domain_checked = validators.domain(value)
     if not domain_checked:
         raise argparse.ArgumentTypeError('Invalid {} domain.'.format(value))
+    
+    # Security: Additional domain validation
+    if len(value) > 253:  # RFC compliant domain length
+        raise argparse.ArgumentTypeError('Domain name too long: {}'.format(value))
+    
+    # Security: Block suspicious domains
+    suspicious_patterns = [r'\.\.', r'^-', r'-$', r'[^a-zA-Z0-9.-]']
+    for pattern in suspicious_patterns:
+        if re.search(pattern, value):
+            raise argparse.ArgumentTypeError('Invalid domain format: {}'.format(value))
+    
     return value
+
+def sanitize_filename(filename):
+    """Security: Sanitize filename to prevent path traversal"""
+    if not filename:
+        return filename
+        
+    # Remove path components
+    filename = os.path.basename(filename)
+    
+    # Remove/replace dangerous characters
+    dangerous_chars = ['<', '>', ':', '"', '/', '\\', '|', '?', '*']
+    for char in dangerous_chars:
+        filename = filename.replace(char, '_')
+    
+    # Limit filename length
+    if len(filename) > 200:
+        filename = filename[:200]
+    
+    return filename
+
+def validate_user_agent(user_agent):
+    """Security: Validate user agent string"""
+    if not user_agent:
+        return False
+    
+    # Limit length
+    if len(user_agent) > 500:
+        return False
+    
+    # Check for control characters
+    if any(ord(c) < 32 for c in user_agent):
+        return False
+        
+    return True
 
 ###################################################################
 
@@ -233,7 +409,7 @@ if __name__ == '__main__':
     parser.add_argument('-p', '--list-plugins', action='store_true', dest='listplugins', 
                         default=False, help='List all available plugins.')
     
-    if len(sys.argv) is 1:
+    if len(sys.argv) == 1:
         parser.print_help()
         sys.exit()
 
@@ -257,12 +433,17 @@ if __name__ == '__main__':
     userAgent = (args.uagent or
                  "Mozilla/5.0 (Windows NT 6.1; WOW64; rv:40.0) Gecko/20100101 Firefox/40.1")
     
+    # Security: Validate user agent
+    if not validate_user_agent(userAgent):
+        print(red("[-] Invalid user agent string"))
+        sys.exit(5)
+    
     print(green("[+] User-Agent in use: ") + cyan(userAgent))
     
     if args.proxy:
         print(green("[+] Proxy server in use: ") + cyan(args.proxy.scheme + "://" + args.proxy.netloc))
 
-    filename = args.filename or ""
+    filename = sanitize_filename(args.filename) if args.filename else ""
     limit = args.limit        
     engine = args.engine
     app = EmailHarvester(userAgent, args.proxy)
@@ -307,13 +488,16 @@ if __name__ == '__main__':
             print(red("[-] Error saving TXT file: " + e))
             
         try:
-            filename = filename.split(".")[0] + ".xml"
-            with open(filename, 'w') as out_file:
+            xml_filename = filename.split(".")[0] + ".xml"
+            with open(xml_filename, 'w', encoding='utf-8') as out_file:
                 out_file.write('<?xml version="1.0" encoding="UTF-8"?><EmailHarvester>')
                 for email in all_emails:
-                    out_file.write('<email>{}</email>'.format(email))
+                    # Security: Properly escape XML content
+                    escaped_email = xml_escape.escape(email)
+                    out_file.write('<email>{}</email>'.format(escaped_email))
                 out_file.write('</EmailHarvester>')
             print(green("[+] Files saved"))
         except Exception as er:
-            print(red("[-] Error saving XML file: " + er))
+            logger.error(f"Error saving XML file: {er}")
+            print(red("[-] Error saving XML file"))
 

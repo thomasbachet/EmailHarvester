@@ -26,7 +26,7 @@ app_emailharvester = None
 
 
 def search(domain, limit):
-    url = 'http://www.baidu.com/search/s?wd="%40{word}"&pn={counter}'
+    url = 'https://www.baidu.com/s?wd="%40{word}"&pn={counter}'
     app_emailharvester.init_search(url, domain, limit, 0, 10, 'Baidu')
     app_emailharvester.process()
     return app_emailharvester.get_emails()
